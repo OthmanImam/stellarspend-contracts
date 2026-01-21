@@ -29,7 +29,8 @@ pub use crate::analytics::{
     find_high_value_transactions, validate_batch,
 };
 pub use crate::types::{
-    AnalyticsEvents, BatchMetrics, CategoryMetrics, DataKey, Transaction, MAX_BATCH_SIZE,
+    AnalyticsEvents, BatchMetrics, CategoryMetrics, DataKey, RatingInput, RatingResult,
+    RatingStatus, Transaction, MAX_BATCH_SIZE,
 };
 
 /// Error codes for the analytics contract.
@@ -118,6 +119,12 @@ impl TransactionAnalyticsContract {
         // Validate individual transactions
         if let Err(_) = validate_batch(&transactions) {
             panic_with_error!(&env, AnalyticsError::InvalidBatch);
+        }
+
+        for tx in transactions.iter() {
+            env.storage()
+                .persistent()
+                .set(&DataKey::KnownTransaction(tx.tx_id), &true);
         }
 
         // Get next batch ID (single read, single write at the end)
@@ -213,6 +220,57 @@ impl TransactionAnalyticsContract {
 
         let current_ledger = env.ledger().sequence() as u64;
         compute_batch_metrics(&env, &transactions, current_ledger)
+    }
+
+    pub fn submit_ratings(
+        env: Env,
+        user: Address,
+        ratings: Vec<RatingInput>,
+    ) -> Vec<RatingResult> {
+        user.require_auth();
+
+        let count = ratings.len();
+        if count == 0 {
+            panic_with_error!(&env, AnalyticsError::EmptyBatch);
+        }
+        if count > MAX_BATCH_SIZE {
+            panic_with_error!(&env, AnalyticsError::BatchTooLarge);
+        }
+
+        let mut results: Vec<RatingResult> = Vec::new(&env);
+
+        for input in ratings.iter() {
+            let mut status = RatingStatus::Success;
+
+            if input.score == 0 || input.score > 5 {
+                status = RatingStatus::InvalidScore;
+            } else {
+                let known = env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::KnownTransaction(input.tx_id));
+                if !known {
+                    status = RatingStatus::UnknownTransaction;
+                } else {
+                    env.storage().persistent().set(
+                        &DataKey::Rating(input.tx_id, user.clone()),
+                        &input.score,
+                    );
+                }
+            }
+
+            let result = RatingResult {
+                tx_id: input.tx_id,
+                score: input.score,
+                status,
+            };
+
+            AnalyticsEvents::rating_submitted(&env, &user, input.tx_id, input.score, status);
+
+            results.push_back(result);
+        }
+
+        results
     }
 
     /// Returns the admin address.
