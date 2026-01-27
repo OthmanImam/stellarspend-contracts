@@ -26,16 +26,14 @@ use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
 
 pub use crate::analytics::{
     compute_batch_checksum, compute_batch_metrics, compute_category_metrics,
-    find_high_value_transactions, validate_audit_logs, validate_batch,
+    create_bundle_result, find_high_value_transactions, validate_audit_logs, validate_batch,
+    validate_bundle_transactions, validate_transaction_for_bundle,
 };
 pub use crate::types::{
-    create_bundle_result, find_high_value_transactions, validate_batch,
-    validate_bundle_transactions, validate_transaction_for_bundle, AnalyticsEvents, AuditLog,
-    BatchMetrics, CategoryMetrics, DataKey, Transaction, MAX_BATCH_SIZE,
-};
-pub use crate::types::{
-    AnalyticsEvents, BatchMetrics, BundleResult, BundledTransaction, CategoryMetrics, DataKey,
-    Transaction, ValidationResult, MAX_BATCH_SIZE,
+    AnalyticsEvents, AuditLog, BatchMetrics, BatchStatusUpdateResult, BundleResult,
+    BundledTransaction, CategoryMetrics, DataKey, RatingInput, RatingResult, RatingStatus,
+    StatusUpdateResult, Transaction, TransactionStatus, TransactionStatusUpdate, ValidationResult,
+    MAX_BATCH_SIZE,
 };
 
 /// Error codes for the analytics contract.
@@ -57,11 +55,11 @@ pub enum AnalyticsError {
     /// Invalid audit log data
     InvalidAuditLog = 7,
     /// Bundle is empty
-    EmptyBundle = 7,
+    EmptyBundle = 8,
     /// Bundle exceeds maximum size
-    BundleTooLarge = 8,
+    BundleTooLarge = 9,
     /// All transactions in bundle are invalid
-    AllTransactionsInvalid = 9,
+    AllTransactionsInvalid = 10,
 }
 
 impl From<AnalyticsError> for soroban_sdk::Error {
@@ -295,7 +293,78 @@ impl TransactionAnalyticsContract {
         compute_batch_metrics(&env, &transactions, current_ledger)
     }
 
-    pub fn submit_ratings(env: Env, user: Address, ratings: Vec<RatingInput>) -> Vec<RatingResult> {
+    pub fn update_transaction_statuses(
+        env: Env,
+        caller: Address,
+        updates: Vec<TransactionStatusUpdate>,
+    ) -> BatchStatusUpdateResult {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        let count = updates.len();
+        if count == 0 {
+            panic_with_error!(&env, AnalyticsError::EmptyBatch);
+        }
+        if count > MAX_BATCH_SIZE {
+            panic_with_error!(&env, AnalyticsError::BatchTooLarge);
+        }
+
+        let mut results: Vec<StatusUpdateResult> = Vec::new(&env);
+        let mut successful: u32 = 0;
+        let mut failed: u32 = 0;
+
+        for update in updates.iter() {
+            let known = env
+                .storage()
+                .persistent()
+                .has(&DataKey::KnownTransaction(update.tx_id));
+
+            if !known {
+                failed += 1;
+                AnalyticsEvents::transaction_status_update_failed(&env, update.tx_id);
+                results.push_back(StatusUpdateResult {
+                    tx_id: update.tx_id,
+                    is_valid: false,
+                });
+                continue;
+            }
+
+            let previous_status: Option<TransactionStatus> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TransactionStatus(update.tx_id));
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::TransactionStatus(update.tx_id), &update.status);
+
+            successful += 1;
+            AnalyticsEvents::transaction_status_updated(
+                &env,
+                update.tx_id,
+                previous_status.clone(),
+                update.status.clone(),
+            );
+
+            results.push_back(StatusUpdateResult {
+                tx_id: update.tx_id,
+                is_valid: true,
+            });
+        }
+
+        BatchStatusUpdateResult {
+            total_requests: count,
+            successful,
+            failed,
+            results,
+        }
+    }
+
+    pub fn submit_ratings(
+        env: Env,
+        user: Address,
+        ratings: Vec<RatingInput>,
+    ) -> Vec<RatingResult> {
         user.require_auth();
 
         let count = ratings.len();
@@ -349,6 +418,13 @@ impl TransactionAnalyticsContract {
             .expect("Contract not initialized")
     }
 
+    /// Returns the stored status for a transaction, if any.
+    pub fn get_transaction_status(env: Env, tx_id: u64) -> Option<TransactionStatus> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::TransactionStatus(tx_id))
+    }
+
     /// Updates the admin address.
     pub fn set_admin(env: Env, current_admin: Address, new_admin: Address) {
         current_admin.require_auth();
@@ -392,7 +468,7 @@ impl TransactionAnalyticsContract {
         Self::require_admin(&env, &caller);
 
         // Validate bundle size
-        let tx_count = bundled_transactions.len();
+        let tx_count = bundled_transactions.len() as u32;
         if tx_count == 0 {
             panic_with_error!(&env, AnalyticsError::EmptyBundle);
         }
@@ -409,7 +485,7 @@ impl TransactionAnalyticsContract {
             + 1;
 
         // Emit bundling started event
-        AnalyticsEvents::bundling_started(&env, bundle_id, tx_count as u32);
+        AnalyticsEvents::bundling_started(&env, bundle_id, tx_count);
 
         // Validate all transactions (handles partial failures gracefully)
         let validation_results = validate_bundle_transactions(&env, &bundled_transactions);
@@ -425,7 +501,6 @@ impl TransactionAnalyticsContract {
                 _valid_count += 1;
             } else {
                 _invalid_count += 1;
-            }
                 AnalyticsEvents::transaction_validation_failed(
                     &env,
                     bundle_id,

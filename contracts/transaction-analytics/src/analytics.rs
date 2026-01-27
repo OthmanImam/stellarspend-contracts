@@ -1,17 +1,9 @@
-//! Core batch analytics computation logic.
-//!
-//! This module provides optimized batch processing for transaction analytics,
-//! following Soroban best practices:
-//! - Minimizes storage operations by accumulating changes locally
-//! - Uses fixed-size structures where possible
-//! - Batches computations to reduce gas costs
-
 use soroban_sdk::{Address, Env, Map, Symbol, Vec};
 
-use crate::types::{AuditLog, BatchMetrics, CategoryMetrics, Transaction, MAX_BATCH_SIZE};
+use crate::AuditLog;
 use crate::types::{
-    BatchMetrics, BundleResult, BundledTransaction, CategoryMetrics, Transaction, ValidationResult,
-    MAX_BATCH_SIZE,
+    BatchMetrics, BundleResult, BundledTransaction, CategoryMetrics, Transaction,
+    ValidationResult, MAX_BATCH_SIZE,
 };
 
 /// Calculates the processing fee for a transaction amount.
@@ -203,8 +195,7 @@ pub fn validate_audit_logs(logs: &Vec<AuditLog>) -> Result<(), &'static str> {
     }
 
     for log in logs.iter() {
-        // Simple check: operation cannot be empty (dummy symbol check if needed)
-        // In Soroban, Symbols are usually non-empty if they represent meaningful strings.
+        // Simple check: operation cannot be empty
         if log.timestamp == 0 {
             return Err("Audit log timestamp cannot be zero");
         }
@@ -254,7 +245,7 @@ pub fn validate_transaction_for_bundle(
         };
     }
 
-    // Validate amount is not zero (optional - you might want to allow zero)
+    // Validate amount is not zero 
     // For now, we'll allow zero amounts
 
     // Transaction is valid
@@ -287,7 +278,7 @@ pub fn validate_bundle_transactions(
 ///
 /// Computes bundle metrics and determines if the bundle can be created.
 pub fn create_bundle_result(
-    env: &Env,
+    _env: &Env,
     bundle_id: u64,
     bundled_transactions: &Vec<BundledTransaction>,
     validation_results: &Vec<ValidationResult>,
