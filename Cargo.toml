@@ -8,6 +8,7 @@ members = [
     "contracts/batch-conversion",
     "contracts/batch-rewards",
     "contracts/batch-payment",
+    "contracts/batch-payment-reminders",
     "contracts/batch-wallet-creation",
     "contracts/budget-recommendations",
     "contracts/shared-budgets",
