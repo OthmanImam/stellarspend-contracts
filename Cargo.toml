@@ -21,6 +21,7 @@ members = [
     "contracts/budget-allocation",
     "contracts/batch-token-mint",
     "contracts/access-control",
+    "contracts/pausable",
 ]
 
 [workspace.package]
