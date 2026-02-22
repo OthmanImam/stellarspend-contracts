@@ -13,7 +13,7 @@ members = [
     "contracts/savings-goals",
     "contracts/escrow",
     "contracts/budget-allocation",
-
+    "contracts/recurring-payment",
 ]
 
 [workspace.package]
