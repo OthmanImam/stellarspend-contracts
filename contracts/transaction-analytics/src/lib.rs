@@ -29,13 +29,15 @@ pub use crate::analytics::{
     find_high_value_transactions, validate_audit_logs, validate_batch,
     process_refund_batch, compute_refund_metrics, validate_refund_batch,
     validate_refund_eligibility, create_bundle_result, validate_bundle_transactions,
-    validate_transaction_for_bundle,
+    validate_transaction_for_bundle, compute_monthly_analytics, update_monthly_analytics_storage,
+    compute_aggregated_analytics, compute_user_spending_summary,
 };
 pub use crate::types::{
     AnalyticsEvents, AuditLog, BatchMetrics, BatchStatusUpdateResult, BundleResult,
     BundledTransaction, CategoryMetrics, DataKey, RatingInput, RatingResult, RatingStatus,
     StatusUpdateResult, Transaction, TransactionStatus, TransactionStatusUpdate, ValidationResult,
     RefundRequest, RefundResult, RefundStatus, RefundBatchMetrics, MAX_BATCH_SIZE,
+    MonthlySpendingAnalytics, UserSpendingSummary,
 };
 
 /// Error codes for the analytics contract.
@@ -751,6 +753,94 @@ impl TransactionAnalyticsContract {
             .unwrap_or_else(|| soroban_sdk::Map::new(&env));
         
         refunded_txs.contains_key(tx_id)
+    }
+
+    /// Updates monthly spending analytics for a user.
+    /// 
+    /// This function calculates and stores monthly spending patterns for a specific user.
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `caller` - The address calling this function (must be admin)
+    /// * `user` - The user address to analyze
+    /// * `transactions` - Vector of transactions to analyze
+    /// * `year` - The year to analyze
+    /// * `month` - The month to analyze
+    pub fn update_monthly_spending_analytics(
+        env: Env,
+        caller: Address,
+        user: Address,
+        transactions: Vec<Transaction>,
+        year: u32,
+        month: u32,
+    ) -> MonthlySpendingAnalytics {
+        caller.require_auth();
+        Self::require_admin(&env, &caller);
+
+        // Validate transactions
+        if let Err(_) = validate_batch(&transactions) {
+            panic_with_error!(&env, AnalyticsError::InvalidBatch);
+        }
+
+        // Compute monthly analytics
+        let analytics = compute_monthly_analytics(&env, &user, &transactions, year, month);
+
+        // Update storage
+        update_monthly_analytics_storage(&env, &analytics);
+
+        // Emit analytics update event
+        AnalyticsEvents::analytics_updated(&env, &user, year, month, &analytics);
+
+        analytics
+    }
+
+    /// Retrieves monthly spending analytics for a user.
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `user` - The user address
+    /// * `year` - The year of the analytics
+    /// * `month` - The month of the analytics
+    /// 
+    /// # Returns
+    /// * `Option<MonthlySpendingAnalytics>` - The stored analytics if found
+    pub fn get_monthly_analytics(
+        env: Env,
+        user: Address,
+        year: u32,
+        month: u32,
+    ) -> Option<MonthlySpendingAnalytics> {
+        let key = DataKey::MonthlyAnalytics(year, month, user);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Gets user spending summary across all tracked periods.
+    /// 
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `user` - The user address
+    /// 
+    /// # Returns
+    /// * `Option<UserSpendingSummary>` - The user spending summary if found
+    pub fn get_user_spending_summary(env: Env, user: Address) -> Option<UserSpendingSummary> {
+        let key = DataKey::UserSpendingSummary(user);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Gets the total number of tracked users.
+    pub fn get_total_tracked_users(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalTrackedUsers)
+            .unwrap_or(0)
+    }
+
+    /// Gets the timestamp of the last analytics update.
+    pub fn get_last_analytics_update(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LastAnalyticsUpdate)
+            .unwrap_or(0)
     }
 
     // Internal helper to verify admin

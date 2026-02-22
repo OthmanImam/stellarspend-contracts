@@ -216,6 +216,15 @@ pub enum DataKey {
     Rating(u64, Address),
     /// Stored status per transaction ID
     TransactionStatus(u64),
+    
+    /// Monthly spending analytics for a user (year, month, user)
+    MonthlyAnalytics(u32, u32, Address),
+    /// User spending summary
+    UserSpendingSummary(Address),
+    /// Total number of unique users tracked
+    TotalTrackedUsers,
+    /// Analytics update timestamp
+    LastAnalyticsUpdate,
 }
 
 /// Status indicating refund eligibility for a transaction.
@@ -276,6 +285,40 @@ pub struct RefundBatchMetrics {
     pub avg_refund_amount: i128,
     /// Timestamp when batch was processed
     pub processed_at: u64,
+}
+
+/// Structure to hold monthly spending analytics for a user
+#[derive(Clone, Debug, Default)]
+#[contracttype]
+pub struct MonthlySpendingAnalytics {
+    /// Year of the analytics
+    pub year: u32,
+    /// Month of the analytics
+    pub month: u32,
+    /// User address
+    pub user: Address,
+    /// Total spending for the month
+    pub total_spending: i128,
+    /// Map of category spending
+    pub category_spending: Vec<(Symbol, i128)>,  // Changed from Map to Vec for contracttype compatibility
+    /// Number of transactions in the period
+    pub transaction_count: u32,
+}
+
+/// Structure for aggregated user spending across multiple months
+#[derive(Clone, Debug, Default)]
+#[contracttype]
+pub struct UserSpendingSummary {
+    /// User address
+    pub user: Address,
+    /// Total spending across all tracked periods
+    pub total_spending: i128,
+    /// Total number of transactions
+    pub total_transactions: u32,
+    /// Most common spending category
+    pub primary_category: Symbol,
+    /// Average monthly spending
+    pub avg_monthly_spending: i128,
 }
 
 /// Events emitted by the analytics contract.
@@ -404,5 +447,17 @@ impl AnalyticsEvents {
     pub fn refund_error(env: &Env, batch_id: u64, tx_id: u64, error_msg: Symbol) {
         let topics = (symbol_short!("refund"), symbol_short!("error"));
         env.events().publish(topics, (batch_id, tx_id, error_msg));
+    }
+    
+    /// Event emitted when analytics are updated for a user.
+    pub fn analytics_updated(
+        env: &Env,
+        user: &Address,
+        year: u32,
+        month: u32,
+        analytics: &MonthlySpendingAnalytics,
+    ) {
+        let topics = (symbol_short!("analytics"), symbol_short!("updated"), user);
+        env.events().publish(topics, (year, month, analytics.total_spending, analytics.transaction_count));
     }
 }
