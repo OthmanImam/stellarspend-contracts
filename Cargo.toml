@@ -23,6 +23,7 @@ members = [
     "contracts/batch-token-mint",
     "contracts/access-control",
     "contracts/pausable",
+    "contracts/audit",
 ]
 
 [workspace.package]
