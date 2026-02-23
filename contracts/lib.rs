@@ -3,8 +3,7 @@
 //! This library provides standardized error handling, common utilities,
 //! and shared functionality for all StellarSpend contracts.
 
-pub mod errors;
-
+pub mod errors;pub mod fees;
 // Re-export commonly used types and functions
 pub use errors::{
     StellarSpendError, ErrorCategory, ErrorSeverity, ErrorDocumentation,
