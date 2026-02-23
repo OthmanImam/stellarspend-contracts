@@ -1,8 +1,8 @@
 #![no_std]
 
-mod types;
 #[cfg(test)]
 mod test;
+mod types;
 
 use crate::types::{DataKey, RecurringPayment};
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol};
@@ -31,7 +31,11 @@ impl RecurringPaymentContract {
             panic!("Interval must be positive");
         }
 
-        let mut count: u64 = env.storage().instance().get(&DataKey::PaymentCount).unwrap_or(0);
+        let mut count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentCount)
+            .unwrap_or(0);
         count += 1;
 
         let payment = RecurringPayment {
@@ -44,7 +48,9 @@ impl RecurringPaymentContract {
             active: true,
         };
 
-        env.storage().instance().set(&DataKey::Payment(count), &payment);
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(count), &payment);
         env.storage().instance().set(&DataKey::PaymentCount, &count);
 
         // Emit creation event
@@ -79,7 +85,7 @@ impl RecurringPaymentContract {
 
         // Update next execution time
         payment.next_execution += payment.interval;
-        
+
         // If the execution was delayed, we might want to skip or catch up.
         // For simplicity, we just add the interval to the scheduled time.
         // If current_time is way past next_execution, catch up.
@@ -90,11 +96,17 @@ impl RecurringPaymentContract {
             payment.next_execution += (intervals_passed + 1) * payment.interval;
         }
 
-        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
 
         // Emit execution event
         env.events().publish(
-            (symbol_short!("recur"), symbol_short!("executed"), payment_id),
+            (
+                symbol_short!("recur"),
+                symbol_short!("executed"),
+                payment_id,
+            ),
             (payment.amount, payment.next_execution),
         );
     }
@@ -110,11 +122,17 @@ impl RecurringPaymentContract {
         payment.sender.require_auth();
 
         payment.active = false;
-        env.storage().instance().set(&DataKey::Payment(payment_id), &payment);
+        env.storage()
+            .instance()
+            .set(&DataKey::Payment(payment_id), &payment);
 
         // Emit cancellation event
         env.events().publish(
-            (symbol_short!("recur"), symbol_short!("canceled"), payment_id),
+            (
+                symbol_short!("recur"),
+                symbol_short!("canceled"),
+                payment_id,
+            ),
             payment.sender,
         );
     }

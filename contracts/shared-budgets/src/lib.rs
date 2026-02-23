@@ -192,12 +192,10 @@ impl SharedBudgetContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalBatches, &(total_batches + 1));
-        env.storage()
-            .instance()
-            .set(
-                &DataKey::TotalAllocationsProcessed,
-                &(total_processed + request_count as u64),
-            );
+        env.storage().instance().set(
+            &DataKey::TotalAllocationsProcessed,
+            &(total_processed + request_count as u64),
+        );
         env.storage().instance().set(
             &DataKey::TotalAllocatedVolume,
             &total_allocated

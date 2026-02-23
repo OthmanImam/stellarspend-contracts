@@ -78,7 +78,8 @@ impl SharedBudgetEvents {
         error_code: u32,
     ) {
         let topics = (symbol_short!("alloc"), symbol_short!("failed"), batch_id);
-        env.events().publish(topics, (recipient.clone(), amount, error_code));
+        env.events()
+            .publish(topics, (recipient.clone(), amount, error_code));
     }
 
     /// Event emitted when allocation batch processing completes.
@@ -90,6 +91,7 @@ impl SharedBudgetEvents {
         total_allocated: i128,
     ) {
         let topics = (symbol_short!("alloc"), symbol_short!("completed"), batch_id);
-        env.events().publish(topics, (successful, failed, total_allocated));
+        env.events()
+            .publish(topics, (successful, failed, total_allocated));
     }
 }
