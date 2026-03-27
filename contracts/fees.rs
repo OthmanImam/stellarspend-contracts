@@ -13,6 +13,8 @@ pub enum DataKey {
     FeePercentage,
     /// Cumulative fees that have been collected through `deduct_fee`.
     TotalFeesCollected,
+    /// Per-user fee accrual tracking. Stores total fees paid by each user.
+    UserFeesAccrued(Address),
 }
 
 #[contracterror]
@@ -25,6 +27,10 @@ pub enum FeeError {
     InvalidPercentage = 4,
     InvalidAmount = 5,
     Overflow = 6,
+    /// Refund amount is invalid (e.g., zero or negative).
+    InvalidRefundAmount = 7,
+    /// User has insufficient fee balance for the requested refund.
+    InsufficientFeeBalance = 8,
 }
 
 /// Events emitted by the fees contract.
@@ -44,6 +50,14 @@ impl FeeEvents {
         env.events().publish(
             topics,
             (admin.clone(), percentage_bps, env.ledger().timestamp()),
+        );
+    }
+
+    pub fn fee_refunded(env: &Env, user: &Address, refund_amount: i128, reason: &str) {
+        let topics = (symbol_short!("fee"), symbol_short!("refunded"));
+        env.events().publish(
+            topics,
+            (user.clone(), refund_amount, reason, env.ledger().timestamp()),
         );
     }
 }
@@ -156,6 +170,8 @@ impl FeesContract {
     ///   a saturated counter triggers `Overflow` rather than wrapping silently.
     /// - Requires the contract to be initialized; `calculate_fee` propagates
     ///   `NotInitialized` via `get_percentage` if called before `initialize`.
+    /// - [SEC-FEES-08] Per-user fee tracking is updated with `checked_add` to
+    ///   prevent overflow on per-user accumulation.
     pub fn deduct_fee(env: Env, payer: Address, amount: i128) -> (i128, i128) {
         // [SEC-FEES-06] Authenticate before any computation or state change.
         payer.require_auth();
@@ -184,6 +200,23 @@ impl FeesContract {
         env.storage()
             .instance()
             .set(&DataKey::TotalFeesCollected, &total);
+
+        // [SEC-FEES-08] Update per-user fee accrual tracking.
+        let mut user_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserFeesAccrued(payer.clone()))
+            .unwrap_or(0);
+
+        // [SEC-FEES-08] Checked addition for per-user total.
+        user_fees = user_fees
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::UserFeesAccrued(payer.clone()), &user_fees);
+
         FeeEvents::fee_deducted(&env, &payer, amount, fee);
         (net, fee)
     }
@@ -194,5 +227,105 @@ impl FeesContract {
             .instance()
             .get(&DataKey::TotalFeesCollected)
             .unwrap_or(0)
+    }
+
+    /// Returns the total fees accrued by a specific user.
+    ///
+    /// Returns 0 if the user has not accrued any fees yet.
+    ///
+    /// # Arguments
+    /// * `user` - The address of the user to query
+    ///
+    /// # Returns
+    /// Total fees paid by the user in stroops (smallest unit)
+    pub fn get_user_fees_accrued(env: Env, user: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::UserFeesAccrued(user))
+            .unwrap_or(0)
+    }
+
+    /// Refunds fees for a specific user.
+    ///
+    /// Only the admin can invoke this function. Validates that the refund amount
+    /// does not exceed the user's accumulated fees. Updates both global and per-user
+    /// fee balances.
+    ///
+    /// # Arguments
+    /// * `caller` - The address requesting the refund (must be admin)
+    /// * `user` - The user to whom fees are refunded
+    /// * `refund_amount` - The amount to refund (must be positive)
+    /// * `reason` - The reason for the refund (for audit trail)
+    ///
+    /// # Returns
+    /// The refunded amount
+    ///
+    /// # Security
+    /// - [SEC-FEES-09] `caller.require_auth()` is invoked first — admin-only refunds.
+    /// - [SEC-FEES-10] `require_admin()` ensures only authorized admins can process
+    ///   refunds, preventing unauthorized fee adjustments.
+    /// - [SEC-FEES-11] Refund amount is validated as positive before any state mutation.
+    /// - [SEC-FEES-12] User's fee balance is checked before refund — prevents negative
+    ///   fee balances which would enable fee credit abuse.
+    /// - [SEC-FEES-13] Checked arithmetic (`checked_sub`) prevents underflow when
+    ///   reducing fee totals.
+    pub fn refund_fee(
+        env: Env,
+        caller: Address,
+        user: Address,
+        refund_amount: i128,
+        reason: &str,
+    ) -> i128 {
+        // [SEC-FEES-09] Authenticate before any computation or state change.
+        caller.require_auth();
+
+        // [SEC-FEES-10] Only admin can process refunds.
+        Self::require_admin(&env, &caller);
+
+        // [SEC-FEES-11] Validate refund amount is positive.
+        if refund_amount <= 0 {
+            panic_with_error!(&env, FeeError::InvalidRefundAmount);
+        }
+
+        // Ensure contract is initialized before proceeding.
+        Self::require_initialized(&env);
+
+        // [SEC-FEES-12] Check user has sufficient fee balance.
+        let user_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserFeesAccrued(user.clone()))
+            .unwrap_or(0);
+
+        if user_fees < refund_amount {
+            panic_with_error!(&env, FeeError::InsufficientFeeBalance);
+        }
+
+        // [SEC-FEES-13] Deduct from global fee total using checked subtraction.
+        let mut total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+
+        total = total
+            .checked_sub(refund_amount)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &total);
+
+        // [SEC-FEES-13] Deduct from per-user fee balance using checked subtraction.
+        let updated_user_fees = user_fees
+            .checked_sub(refund_amount)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        env.storage()
+            .instance()
+            .set(&DataKey::UserFeesAccrued(user.clone()), &updated_user_fees);
+
+        FeeEvents::fee_refunded(&env, &user, refund_amount, reason);
+        refund_amount
     }
 }
