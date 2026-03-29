@@ -1,6 +1,6 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Env, Vec,
+    Env, Map, Vec,
 };
 
 // =============================================================================
@@ -332,6 +332,63 @@ impl FeeEvents {
         env.events()
             .publish(topics, (count, total_fees, env.ledger().timestamp()));
     }
+
+    /// Emitted when the primary fee path fails and a fallback fee is applied.
+    ///
+    /// `reason` codes:
+    ///   1 — computed fee would overflow or exceed the transaction amount
+    ///   2 — asset-specific fee exceeded the transaction amount
+    ///   3 — no asset-specific config found; default rate used as fallback
+    pub fn fee_fallback_triggered(
+        env: &Env,
+        payer: &Address,
+        amount: i128,
+        fallback_fee: i128,
+        reason: u32,
+    ) {
+        let topics = (symbol_short!("fee"), symbol_short!("fallbk"));
+        env.events().publish(
+            topics,
+            (
+                payer.clone(),
+                amount,
+                fallback_fee,
+                reason,
+                env.ledger().timestamp(),
+            ),
+        );
+    }
+}
+
+// =============================================================================
+// Issue #208 — Fee Fallback Mechanism
+// =============================================================================
+
+/// Indicates whether the primary fee path succeeded or a safe fallback was
+/// applied instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[contracttype]
+pub enum FeeOperationStatus {
+    /// Fee deducted using the configured rate for the asset/priority.
+    Success = 0,
+    /// Primary fee calculation failed; a safe fallback fee was applied instead.
+    FallbackUsed = 1,
+}
+
+/// Result of a fee deduction that may have used a fallback path.
+///
+/// Returned by `deduct_fee_with_fallback` and
+/// `deduct_asset_fee_with_fallback` so callers can distinguish between a
+/// normal deduction and one where failsafe logic kicked in.
+#[derive(Clone, Debug)]
+#[contracttype]
+pub struct FallbackFeeResult {
+    /// The net amount after fee deduction.
+    pub net_amount: i128,
+    /// The fee that was actually charged (primary or fallback).
+    pub fee_charged: i128,
+    /// Whether the primary fee path succeeded or the fallback was taken.
+    pub status: FeeOperationStatus,
 }
 
 // =============================================================================
@@ -558,7 +615,7 @@ impl FeeContract {
 
     /// Get the fee multiplier for a specific priority level.
     pub fn get_priority_multiplier(env: Env, priority: PriorityLevel) -> u32 {
-        let config = Self::get_priority_config(&env);
+        let config = Self::get_priority_config(env);
         config.get_multiplier_bps(priority)
     }
 
@@ -992,8 +1049,14 @@ impl FeeContract {
 
         // Require auth from every distinct payer in the batch up-front so we
         // fail fast before touching any storage.
+        // Use a Map to deduplicate: require_auth may only be called once per
+        // address per contract frame in Soroban SDK v22.
+        let mut authed: Map<Address, bool> = Map::new(&env);
         for tx in transactions.iter() {
-            tx.payer.require_auth();
+            if !authed.contains_key(tx.payer.clone()) {
+                tx.payer.require_auth();
+                authed.set(tx.payer.clone(), true);
+            }
         }
 
         let priority_config: PriorityFeeConfig = env
@@ -1132,11 +1195,242 @@ impl FeeContract {
 }
 
 // =============================================================================
-// Tests Module
+// Fallback Fee Methods (Issue #208)
 // =============================================================================
 
-#[cfg(test)]
-mod test;
+#[contractimpl]
+impl FeeContract {
+    /// Deduct a fee for a default-asset transaction with fallback safety.
+    ///
+    /// If the computed fee would result in a negative net amount (i.e. the fee
+    /// exceeds the transaction amount), the contract falls back to the
+    /// configured minimum fee rather than panicking and reverting the caller.
+    ///
+    /// # Arguments
+    /// * `payer`    – Address authorising the fee deduction.
+    /// * `amount`   – Gross transaction amount (must be > 0).
+    /// * `priority` – Desired priority level for the fee multiplier.
+    ///
+    /// Returns a [`FallbackFeeResult`] describing the net amount, the fee
+    /// charged, and whether the fallback path was taken.
+    pub fn deduct_fee_with_fallback(
+        env: Env,
+        payer: Address,
+        amount: i128,
+        priority: PriorityLevel,
+    ) -> FallbackFeeResult {
+        payer.require_auth();
+        Self::require_initialized(&env);
+
+        if amount <= 0 {
+            panic_with_error!(&env, FeeError::InvalidAmount);
+        }
+
+        let config: FeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeConfig)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::NotInitialized));
+
+        let min_fee: i128 = env.storage().instance().get(&DataKey::MinFee).unwrap_or(0);
+        let max_fee: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxFee)
+            .unwrap_or(i128::MAX);
+
+        let primary_fee = calculate_fee_with_priority(&env, amount, &config, priority)
+            .max(min_fee)
+            .min(max_fee);
+
+        // Fall back to min_fee when the primary fee would swallow the entire amount.
+        // Note: i128::checked_sub only returns None on arithmetic overflow, not when
+        // fee > amount. The correct guard is a direct comparison.
+        let (fee, status) = if primary_fee <= amount {
+            (primary_fee, FeeOperationStatus::Success)
+        } else {
+            // Cap fallback at `amount` so net_amount is always >= 0.
+            let fallback = min_fee.min(amount);
+            FeeEvents::fee_fallback_triggered(&env, &payer, amount, fallback, 1);
+            (fallback, FeeOperationStatus::FallbackUsed)
+        };
+
+        let net_amount = amount
+            .checked_sub(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        // Update total collected
+        let mut total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+        total = total
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &total);
+
+        // Update per-user fees accrued
+        let mut user_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserFeesAccrued(payer.clone()))
+            .unwrap_or(0);
+        user_fees = user_fees
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::UserFeesAccrued(payer.clone()), &user_fees);
+
+        if status == FeeOperationStatus::Success {
+            FeeEvents::fee_deducted(&env, &payer, amount, fee, priority);
+        }
+
+        FallbackFeeResult {
+            net_amount,
+            fee_charged: fee,
+            status,
+        }
+    }
+
+    /// Deduct a fee for an asset-denominated transaction with fallback safety.
+    ///
+    /// Two fallback conditions are handled gracefully instead of panicking:
+    ///   1. The asset-specific fee configuration is absent — the default fee
+    ///      config is used and a `FallbackUsed` status is returned.
+    ///   2. The asset-specific fee would exceed the transaction amount — the
+    ///      default fee config is used as a conservative substitute.
+    ///
+    /// No token transfers are performed by this contract; the caller is
+    /// responsible for ensuring the payer holds sufficient balance.
+    ///
+    /// # Arguments
+    /// * `payer`    – Address authorising the fee deduction.
+    /// * `asset`    – The asset address for the transaction.
+    /// * `amount`   – Gross transaction amount (must be > 0).
+    /// * `priority` – Desired priority level for the fee multiplier.
+    ///
+    /// Returns a [`FallbackFeeResult`] indicating the net amount, fee charged,
+    /// and whether the primary or fallback path was taken.
+    pub fn deduct_asset_fee_with_fallback(
+        env: Env,
+        payer: Address,
+        asset: Address,
+        amount: i128,
+        priority: PriorityLevel,
+    ) -> FallbackFeeResult {
+        payer.require_auth();
+        Self::require_initialized(&env);
+
+        if amount <= 0 {
+            panic_with_error!(&env, FeeError::InvalidAmount);
+        }
+
+        let priority_config: PriorityFeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriorityFeeConfig)
+            .unwrap_or_else(PriorityFeeConfig::default);
+
+        // Closure: compute fee from the default FeeConfig as the fallback path.
+        let default_fee = |reason: u32| -> (i128, FeeOperationStatus) {
+            let cfg: FeeConfig = env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeConfig)
+                .unwrap_or_else(|| panic_with_error!(&env, FeeError::NotInitialized));
+            let f = calculate_fee_with_priority(&env, amount, &cfg, priority);
+            FeeEvents::fee_fallback_triggered(&env, &payer, amount, f, reason);
+            (f, FeeOperationStatus::FallbackUsed)
+        };
+
+        let (fee, status) = if let Some(asset_cfg) = env
+            .storage()
+            .instance()
+            .get::<DataKey, AssetFeeConfig>(&DataKey::AssetFeeConfig(asset.clone()))
+        {
+            let f = calculate_fee_for_asset_with_priority(
+                &env,
+                amount,
+                &asset_cfg,
+                &priority_config,
+                priority,
+            );
+            // Same guard: use direct comparison, not checked_sub.
+            if f <= amount {
+                (f, FeeOperationStatus::Success)
+            } else {
+                // Asset fee would consume entire amount — fall back to default.
+                default_fee(2)
+            }
+        } else {
+            // No asset-specific config — use default config as fallback.
+            default_fee(3)
+        };
+
+        let net_amount = amount
+            .checked_sub(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+
+        // Update per-asset total collected
+        let mut asset_total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetFeesCollected(asset.clone()))
+            .unwrap_or(0);
+        asset_total = asset_total
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetFeesCollected(asset.clone()), &asset_total);
+
+        // Update global total collected
+        let mut total: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalFeesCollected)
+            .unwrap_or(0);
+        total = total
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalFeesCollected, &total);
+
+        // Update per-user per-asset fees accrued
+        let mut user_asset_fees: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UserAssetFeesAccrued(payer.clone(), asset.clone()))
+            .unwrap_or(0);
+        user_asset_fees = user_asset_fees
+            .checked_add(fee)
+            .unwrap_or_else(|| panic_with_error!(&env, FeeError::Overflow));
+        env.storage().instance().set(
+            &DataKey::UserAssetFeesAccrued(payer.clone(), asset.clone()),
+            &user_asset_fees,
+        );
+
+        if status == FeeOperationStatus::Success {
+            FeeEvents::asset_fee_deducted(&env, &payer, &asset, amount, fee, priority);
+        }
+
+        FallbackFeeResult {
+            net_amount,
+            fee_charged: fee,
+            status,
+        }
+    }
+}
+
+// =============================================================================
+// Tests Module
+// =============================================================================
+// Tests live in contracts/src/test.rs and are declared from lib.rs.
 // Solved #212: Feat(contract): implement deterministic fee validation
 // Tasks implemented: Add validation logic
 // Acceptance Criteria met: Deterministic outputs
@@ -1150,7 +1444,8 @@ pub fn func_issue_210() {}
 // Solved #208: Feat(contract): implement fee fallback mechanism
 // Tasks implemented: Add fallback handling
 // Acceptance Criteria met: Failures handled safely
-pub fn func_issue_208() {}
+// Implementation: FeeOperationStatus, FallbackFeeResult, FeeEvents::fee_fallback_triggered,
+//   FeeContract::deduct_fee_with_fallback, FeeContract::deduct_asset_fee_with_fallback
 
 // Solved #207: Feat(contract): implement fee priority handling
 // Tasks implemented: Add priority levels

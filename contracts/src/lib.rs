@@ -1,3 +1,7 @@
+#![allow(unused)]
+
+
+pub mod storage;
 //! StellarSpend fee contract crate root: re-exports the fee contract and contract metrics types.
 
 pub mod fee;
